@@ -1,0 +1,174 @@
+// ==UserScript==
+// @name         Twitter Ratio Filter
+// @namespace    http://tampermonkey.net/
+// @version      0.1
+// @description  Hide tweets from accounts based on follower counts (excluding mutuals)
+// @author       You
+// @match        *://*.twitter.com/*
+// @match        *://*.x.com/*
+// @include      *://*.twitter.com/*
+// @include      *://*.x.com/*
+// @grant        GM_log
+// @run-at       document-start
+// ==/UserScript==
+
+
+(function() {
+    'use strict';
+
+    const settings = {
+        follow_limit: 100, // Minimum follower threshold
+    };
+
+    let blf_exception_log = [];
+
+    function log_exception(e) {
+        while (blf_exception_log.length >= 10) {
+            blf_exception_log.shift();
+        }
+        blf_exception_log.push(e);
+        console.log('log_exception() got exception: ', e);
+    }
+
+    class TwitterUser {
+        constructor(id, handle, name, followers, friends_count, we_follow, followed_by) {
+            this.id = id;
+            this.handle = handle;
+            this.name = name;
+            this.followers = followers;
+            this.friends_count = friends_count;
+            this.we_follow = we_follow;
+            this.followed_by = followed_by;
+            this.normalized_ratio = null;
+        }
+
+        calculateNormalizedRatio() {
+            if (this.friends_count === 0) {
+                this.normalized_ratio = 100;
+            } else {
+                this.normalized_ratio = ((this.followers - this.friends_count) / (this.followers + this.friends_count)) * 100;
+            }
+        }
+    }
+
+    // Hook XMLHttpRequest to intercept Twitter API responses
+    const oldXHROpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function() {
+        if (arguments.length >= 2) {
+            const url = arguments[1];
+
+            // Hook various Twitter API endpoints
+            if (url.includes('/HomeTimeline') ||
+                url.includes('/HomeLatestTimeline') ||
+                url.includes('/TweetDetail') ||
+                url.includes('/search/adaptive.json') ||
+                url.includes('/notifications/all.json') ||
+                url.includes('/notifications/mentions.json')) {
+
+                if (!this._hooked) {
+                    this._hooked = true;
+                    hookXHRResponse(this);
+                }
+            }
+        }
+        return oldXHROpen.apply(this, arguments);
+    };
+
+    function hookXHRResponse(xhr) {
+        const getter = function() {
+            delete xhr.responseText;
+            let response = xhr.responseText;
+
+            try {
+                let json = JSON.parse(response);
+                filterContent(json);
+                response = JSON.stringify(json);
+            } catch (e) {
+                log_exception(e);
+            }
+
+            Object.defineProperty(xhr, 'responseText', {
+                value: response,
+                writable: false
+            });
+            return response;
+        };
+
+        Object.defineProperty(xhr, 'responseText', {
+            get: getter,
+            configurable: true
+        });
+    }
+
+    function shouldHideUser(user) {
+        return (user.followers < settings.follow_limit) && !user.we_follow && !user.followed_by;
+    }
+
+    function hideTweet(tweetResults) {
+        if (tweetResults.result && tweetResults.result.__typename === 'Tweet') {
+            tweetResults.result.__typename = '';
+        }
+    }
+
+    function filterContent(json) {
+        // Process timeline data
+        if (json.data && (json.data.home || json.data.threaded_conversation_with_injections_v2)) {
+            const instructions = json.data.home?.home_timeline_urt?.instructions ||
+                               json.data.threaded_conversation_with_injections_v2?.instructions || [];
+
+            instructions.forEach(instruction => {
+                if (instruction.type === 'TimelineAddEntries') {
+                    instruction.entries.forEach(entry => {
+                        processEntry(entry);
+                    });
+                }
+            });
+        }
+    }
+
+    function processEntry(entry) {
+        if (!entry.content) return;
+
+        if (entry.content.entryType === 'TimelineTimelineItem') {
+            processTimelineItem(entry.content.itemContent);
+        } else if (entry.content.entryType === 'TimelineTimelineModule') {
+            entry.content.items?.forEach(item => {
+                processTimelineItem(item.item.itemContent);
+            });
+        }
+    }
+
+    function processTimelineItem(itemContent) {
+        if (!itemContent || itemContent.itemType !== 'TimelineTweet') return;
+
+        const tweetResults = itemContent.tweet_results;
+        if (!tweetResults?.result) return;
+
+        const userData = extractUserData(tweetResults.result);
+        if (!userData) return;
+
+        if (shouldHideUser(userData)) {
+            hideTweet(tweetResults);
+            console.log(`Filtered tweet from @${userData.handle} (${userData.followers} followers)`);
+        }
+    }
+
+    function extractUserData(tweetData) {
+        if (!tweetData.core?.user_results?.result) return null;
+
+        const userData = tweetData.core.user_results.result;
+        const legacyData = userData.legacy;
+
+        return new TwitterUser(
+            userData.rest_id,
+            legacyData.screen_name,
+            legacyData.name,
+            legacyData.followers_count,
+            legacyData.friends_count,
+            legacyData.following,
+            legacyData.followed_by
+        );
+    }
+
+    console.log('Twitter Ratio Filter: Loaded');
+})();
