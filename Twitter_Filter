@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Twitter Ratio & Keyword Filter
 // @namespace    http://tampermonkey.net/
-// @version      0.3
-// @description  Hide tweets from accounts based on keywords or suspicious follower/following ratios (excluding mutuals)
+// @version      0.4
+// @description  Hide tweets from accounts based on keywords or suspicious follower/following ratios (excluding mutuals + CSV whitelisted)
 // @author       You
 // @match        *://*.twitter.com/*
 // @match        *://*.x.com/*
@@ -15,15 +15,23 @@
 (function() {
     'use strict';
 
-    // Comma-separated list of banned words to check in handle/description
+    // 1. Comma-separated list of banned words to check in handle/description
     const bannedWordsList = "groyper,nafo";
-    // Convert to array of trimmed lowercase words
     const bannedWords = bannedWordsList.split(',')
         .map(w => w.trim().toLowerCase())
-        .filter(w => w);
+        .filter(Boolean);
+
+    // 2. Comma-separated CSV of whitelisted handles (lowercase them for convenience)
+    // Example: "coolDude,SomeFriend,AnotherPal"
+    const whitelistedHandlesCSV = "someVIP,anotherVIP";
+    const whitelistedHandles = new Set(
+        whitelistedHandlesCSV.split(',')
+            .map(h => h.trim().toLowerCase())
+            .filter(Boolean)
+    );
 
     const settings = {
-        follow_limit: 100, // Minimum follower threshold
+        follow_limit: 100, // minimum follower threshold
     };
 
     let blf_exception_log = [];
@@ -55,13 +63,14 @@
         if (arguments.length >= 2) {
             const url = arguments[1];
             // Hook various Twitter API endpoints
-            if (url.includes('/HomeTimeline') ||
+            if (
+                url.includes('/HomeTimeline') ||
                 url.includes('/HomeLatestTimeline') ||
                 url.includes('/TweetDetail') ||
                 url.includes('/search/adaptive.json') ||
                 url.includes('/notifications/all.json') ||
-                url.includes('/notifications/mentions.json')) {
-
+                url.includes('/notifications/mentions.json')
+            ) {
                 if (!this._hooked) {
                     this._hooked = true;
                     hookXHRResponse(this);
@@ -101,28 +110,32 @@
      * Return an array of reasons to hide the user, or an empty array if no hide.
      */
     function getHideReasons(user) {
-        // Bypass checks if mutual or we follow them
+        // 1. Skip checks if we follow them or they follow us
         if (user.we_follow || user.followed_by) {
+            return [];
+        }
+
+        // 2. Skip if handle is in CSV-based whitelist
+        if (whitelistedHandles.has(user.handle.toLowerCase())) {
             return [];
         }
 
         let reasons = [];
 
-        // 1) Check banned words in handle or description
+        // a) Check banned words in handle or description
         const handleDesc = (user.handle + " " + user.description).toLowerCase();
         for (const w of bannedWords) {
             if (handleDesc.includes(w)) {
                 reasons.push(`matched banned keyword: "${w}"`);
-                // Don't break; if they fail multiple checks, we'll log them all.
             }
         }
 
-        // 2) Check if following >= 10x the number of followers
+        // b) Check if following >= 10x the number of followers
         if (user.followers > 0 && user.friends_count >= 10 * user.followers) {
             reasons.push("follows >= 10x more accounts than followers");
         }
 
-        // 3) Check if they have fewer than follow_limit followers
+        // c) Check if they have fewer than follow_limit followers
         if (user.followers < settings.follow_limit) {
             reasons.push(`has fewer than ${settings.follow_limit} followers`);
         }
@@ -204,5 +217,5 @@
         );
     }
 
-    console.log('Twitter Ratio & Keyword Filter: Loaded');
+    console.log('Twitter Ratio & Keyword Filter with CSV Whitelist: Loaded');
 })();
