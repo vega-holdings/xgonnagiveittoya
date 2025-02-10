@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Twitter Ratio Filter
+// @name         Twitter Ratio & Keyword Filter
 // @namespace    http://tampermonkey.net/
-// @version      0.1
-// @description  Hide tweets from accounts based on follower counts (excluding mutuals)
+// @version      0.3
+// @description  Hide tweets from accounts based on keywords or suspicious follower/following ratios (excluding mutuals)
 // @author       You
 // @match        *://*.twitter.com/*
 // @match        *://*.x.com/*
@@ -12,9 +12,15 @@
 // @run-at       document-start
 // ==/UserScript==
 
-
 (function() {
     'use strict';
+
+    // Comma-separated list of banned words to check in handle/description
+    const bannedWordsList = "groyper,nafo";
+    // Convert to array of trimmed lowercase words
+    const bannedWords = bannedWordsList.split(',')
+        .map(w => w.trim().toLowerCase())
+        .filter(w => w);
 
     const settings = {
         follow_limit: 100, // Minimum follower threshold
@@ -31,7 +37,7 @@
     }
 
     class TwitterUser {
-        constructor(id, handle, name, followers, friends_count, we_follow, followed_by) {
+        constructor(id, handle, name, followers, friends_count, we_follow, followed_by, description) {
             this.id = id;
             this.handle = handle;
             this.name = name;
@@ -39,24 +45,15 @@
             this.friends_count = friends_count;
             this.we_follow = we_follow;
             this.followed_by = followed_by;
-            this.normalized_ratio = null;
-        }
-
-        calculateNormalizedRatio() {
-            if (this.friends_count === 0) {
-                this.normalized_ratio = 100;
-            } else {
-                this.normalized_ratio = ((this.followers - this.friends_count) / (this.followers + this.friends_count)) * 100;
-            }
+            this.description = description || "";
         }
     }
 
-    // Hook XMLHttpRequest to intercept Twitter API responses
+    // Intercept Twitter API responses
     const oldXHROpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function() {
         if (arguments.length >= 2) {
             const url = arguments[1];
-
             // Hook various Twitter API endpoints
             if (url.includes('/HomeTimeline') ||
                 url.includes('/HomeLatestTimeline') ||
@@ -100,8 +97,37 @@
         });
     }
 
-    function shouldHideUser(user) {
-        return (user.followers < settings.follow_limit) && !user.we_follow && !user.followed_by;
+    /**
+     * Return an array of reasons to hide the user, or an empty array if no hide.
+     */
+    function getHideReasons(user) {
+        // Bypass checks if mutual or we follow them
+        if (user.we_follow || user.followed_by) {
+            return [];
+        }
+
+        let reasons = [];
+
+        // 1) Check banned words in handle or description
+        const handleDesc = (user.handle + " " + user.description).toLowerCase();
+        for (const w of bannedWords) {
+            if (handleDesc.includes(w)) {
+                reasons.push(`matched banned keyword: "${w}"`);
+                // Don't break; if they fail multiple checks, we'll log them all.
+            }
+        }
+
+        // 2) Check if following >= 10x the number of followers
+        if (user.followers > 0 && user.friends_count >= 10 * user.followers) {
+            reasons.push("follows >= 10x more accounts than followers");
+        }
+
+        // 3) Check if they have fewer than follow_limit followers
+        if (user.followers < settings.follow_limit) {
+            reasons.push(`has fewer than ${settings.follow_limit} followers`);
+        }
+
+        return reasons;
     }
 
     function hideTweet(tweetResults) {
@@ -112,9 +138,12 @@
 
     function filterContent(json) {
         // Process timeline data
-        if (json.data && (json.data.home || json.data.threaded_conversation_with_injections_v2)) {
-            const instructions = json.data.home?.home_timeline_urt?.instructions ||
-                               json.data.threaded_conversation_with_injections_v2?.instructions || [];
+        if (json.data) {
+            const instructions = (
+                json.data.home?.home_timeline_urt?.instructions ||
+                json.data.threaded_conversation_with_injections_v2?.instructions ||
+                []
+            );
 
             instructions.forEach(instruction => {
                 if (instruction.type === 'TimelineAddEntries') {
@@ -147,28 +176,33 @@
         const userData = extractUserData(tweetResults.result);
         if (!userData) return;
 
-        if (shouldHideUser(userData)) {
+        const reasons = getHideReasons(userData);
+        if (reasons.length > 0) {
             hideTweet(tweetResults);
-            console.log(`Filtered tweet from @${userData.handle} (${userData.followers} followers)`);
+            console.log(
+                `Filtered tweet from @${userData.handle} (followers: ${userData.followers}, following: ${userData.friends_count}). Reasons: ${reasons.join("; ")}`
+            );
         }
     }
 
     function extractUserData(tweetData) {
         if (!tweetData.core?.user_results?.result) return null;
 
-        const userData = tweetData.core.user_results.result;
-        const legacyData = userData.legacy;
+        const userObj = tweetData.core.user_results.result;
+        const legacyData = userObj.legacy;
+        if (!legacyData) return null;
 
         return new TwitterUser(
-            userData.rest_id,
+            userObj.rest_id,
             legacyData.screen_name,
             legacyData.name,
             legacyData.followers_count,
             legacyData.friends_count,
             legacyData.following,
-            legacyData.followed_by
+            legacyData.followed_by,
+            legacyData.description
         );
     }
 
-    console.log('Twitter Ratio Filter: Loaded');
+    console.log('Twitter Ratio & Keyword Filter: Loaded');
 })();
